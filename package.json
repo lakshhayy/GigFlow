@@ -23,7 +23,9 @@
     "cookie-parser": "^1.4.7",
     "socket.io": "^4.8.1",
     "socket.io-client": "^4.8.1",
-    "http": "^0.0.1-security"
+    "http": "^0.0.1-security",
+    "path": "^0.12.7",
+    "url": "^0.11.4"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",

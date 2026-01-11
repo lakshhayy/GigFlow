@@ -6,26 +6,34 @@ import cors from 'cors';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import cookieParser from 'cookie-parser';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { User, Gig, Bid } from './models.js';
+
+// Configuration for ES Modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 const server = http.createServer(app);
-const PORT = 5000;
-const JWT_SECRET = 'your-secret-key-change-in-prod';
-const MONGO_URI = 'mongodb://127.0.0.1:27017/gigflow';
+
+// Use Environment Variables for Production
+const PORT = process.env.PORT || 5000;
+const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/gigflow';
+const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:5173';
 
 // Middleware
 app.use(express.json());
 app.use(cookieParser());
 app.use(cors({
-  origin: 'http://localhost:5173', // Must match your Vite frontend URL
-  credentials: true, // Allow cookies
+  origin: CLIENT_URL, 
+  credentials: true, 
 }));
 
 // --- Socket.io Setup ---
 const io = new Server(server, {
   cors: {
-    origin: "http://localhost:5173",
+    origin: CLIENT_URL,
     credentials: true,
     methods: ["GET", "POST"]
   }
@@ -53,7 +61,7 @@ const authenticateToken = (req, res, next) => {
   const token = req.cookies.token;
   if (!token) return res.sendStatus(401);
 
-  jwt.verify(token, JWT_SECRET, (err, user) => {
+  jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key-change-in-prod', (err, user) => {
     if (err) return res.sendStatus(403);
     req.user = user;
     next();
@@ -70,12 +78,12 @@ app.post('/api/auth/register', async (req, res) => {
     const hashedPassword = await bcrypt.hash(password, 10);
     const user = await User.create({ name, email, password: hashedPassword });
     
-    const token = jwt.sign({ id: user._id, name: user.name }, JWT_SECRET, { expiresIn: '1d' });
+    const token = jwt.sign({ id: user._id, name: user.name }, process.env.JWT_SECRET || 'your-secret-key-change-in-prod', { expiresIn: '1d' });
     
     // Set HttpOnly Cookie
     res.cookie('token', token, {
       httpOnly: true,
-      secure: false, // Set to true in production with HTTPS
+      secure: process.env.NODE_ENV === 'production', 
       sameSite: 'lax',
       maxAge: 24 * 60 * 60 * 1000 // 1 day
     });
@@ -95,12 +103,12 @@ app.post('/api/auth/login', async (req, res) => {
     const validPassword = await bcrypt.compare(password, user.password);
     if (!validPassword) return res.status(400).json({ message: 'Invalid credentials' });
 
-    const token = jwt.sign({ id: user._id, name: user.name }, JWT_SECRET, { expiresIn: '1d' });
+    const token = jwt.sign({ id: user._id, name: user.name }, process.env.JWT_SECRET || 'your-secret-key-change-in-prod', { expiresIn: '1d' });
 
     // Set HttpOnly Cookie
     res.cookie('token', token, {
       httpOnly: true,
-      secure: false, // Set to true in production with HTTPS
+      secure: process.env.NODE_ENV === 'production',
       sameSite: 'lax',
       maxAge: 24 * 60 * 60 * 1000 // 1 day
     });
@@ -265,6 +273,18 @@ app.patch('/api/bids/:bidId/hire', authenticateToken, async (req, res) => {
     session.endSession();
   }
 });
+
+// --- Production: Serve Static Frontend ---
+if (process.env.NODE_ENV === 'production') {
+  // Serve any static files from the dist folder (Vite build output)
+  // Assuming the folder structure is root/server/index.js and root/dist
+  app.use(express.static(path.join(__dirname, '../dist')));
+
+  // Handle React routing, return all requests to React app
+  app.get('*', (req, res) => {
+    res.sendFile(path.join(__dirname, '../dist', 'index.html'));
+  });
+}
 
 // Connect DB and Start Server
 mongoose.connect(MONGO_URI)
