@@ -67,6 +67,11 @@ export const GigDetails: React.FC = () => {
       alert('Bid submitted successfully!');
       setBidMessage('');
       setBidPrice('');
+      // Optimistically add bid to list if owner is viewing (edge case where owner bids on own gig for testing)
+      if (user.id === gig.ownerId) {
+         const newBids = await getBidsForGig(gig.id);
+         setBids(newBids);
+      }
     } catch (err: any) {
       setBidError(err.message);
     } finally {
@@ -76,15 +81,39 @@ export const GigDetails: React.FC = () => {
 
   const handleHire = async (bidId: string) => {
     if (!gig || isHiring) return;
-    if (!window.confirm("Are you sure you want to hire this freelancer? This will reject all other bids.")) return;
+    console.log("Attempting to hire bid:", bidId);
+    
+    if (!window.confirm("Are you sure you want to hire this freelancer? This will reject all other bids.")) {
+      console.log("Hire cancelled by user");
+      return;
+    }
 
     setIsHiring(true);
     try {
       await hireFreelancer(gig.id, bidId);
-      // Refresh data
-      await loadData(gig.id);
+      console.log("Hire API call successful");
+      
+      // Optimistic Update: Update UI immediately
+      // We explicitly create new object references to ensure React re-renders
+      setGig(prev => {
+        if (!prev) return null;
+        return { ...prev, status: 'assigned' };
+      });
+      
+      setBids(prev => prev.map(b => {
+        if (b.id === bidId) {
+          return { ...b, status: 'hired' };
+        } else {
+          return { ...b, status: 'rejected' };
+        }
+      }));
+
+      // REMOVED: The background re-fetch logic was causing race conditions 
+      // where stale data was overwriting the optimistic update.
+      
     } catch (err: any) {
-      alert(err.message);
+      console.error("Hire failed", err);
+      alert('Hiring failed: ' + err.message);
     } finally {
       setIsHiring(false);
     }
@@ -155,13 +184,14 @@ export const GigDetails: React.FC = () => {
                       <p className="text-gray-600 mt-2">{bid.message}</p>
                       <p className="text-sm text-gray-400 mt-2">Bid: ${bid.price}</p>
                     </div>
+                    {/* Hire Button Logic: Only show if gig is open AND this bid is pending */}
                     {gig.status === 'open' && bid.status === 'pending' && (
                       <button
                         onClick={() => handleHire(bid.id)}
                         disabled={isHiring}
-                        className="bg-primary hover:bg-indigo-700 text-white px-4 py-2 rounded-md text-sm font-medium shadow-sm transition-colors"
+                        className="bg-primary hover:bg-indigo-700 text-white px-4 py-2 rounded-md text-sm font-medium shadow-sm transition-colors disabled:opacity-50"
                       >
-                        Hire Now
+                        {isHiring ? 'Processing...' : 'Hire Now'}
                       </button>
                     )}
                   </div>

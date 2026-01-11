@@ -1,22 +1,56 @@
 import express from 'express';
+import http from 'http';
+import { Server } from 'socket.io';
 import mongoose from 'mongoose';
 import cors from 'cors';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
+import cookieParser from 'cookie-parser';
 import { User, Gig, Bid } from './models.js';
 
 const app = express();
+const server = http.createServer(app);
 const PORT = 5000;
 const JWT_SECRET = 'your-secret-key-change-in-prod';
 const MONGO_URI = 'mongodb://127.0.0.1:27017/gigflow';
 
+// Middleware
 app.use(express.json());
-app.use(cors());
+app.use(cookieParser());
+app.use(cors({
+  origin: 'http://localhost:5173', // Must match your Vite frontend URL
+  credentials: true, // Allow cookies
+}));
+
+// --- Socket.io Setup ---
+const io = new Server(server, {
+  cors: {
+    origin: "http://localhost:5173",
+    credentials: true,
+    methods: ["GET", "POST"]
+  }
+});
+
+io.on('connection', (socket) => {
+  // console.log('New client connected:', socket.id);
+
+  // Clients join a room named after their userId
+  socket.on('join', (userId) => {
+    if (userId) {
+      socket.join(userId);
+      // console.log(`Socket ${socket.id} joined room ${userId}`);
+    }
+  });
+
+  socket.on('disconnect', () => {
+    // console.log('Client disconnected:', socket.id);
+  });
+});
+
 
 // --- Middleware ---
 const authenticateToken = (req, res, next) => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
+  const token = req.cookies.token;
   if (!token) return res.sendStatus(401);
 
   jwt.verify(token, JWT_SECRET, (err, user) => {
@@ -36,8 +70,17 @@ app.post('/api/auth/register', async (req, res) => {
     const hashedPassword = await bcrypt.hash(password, 10);
     const user = await User.create({ name, email, password: hashedPassword });
     
-    const token = jwt.sign({ id: user._id, name: user.name }, JWT_SECRET);
-    res.json({ user: { id: user._id, name: user.name, email: user.email }, token });
+    const token = jwt.sign({ id: user._id, name: user.name }, JWT_SECRET, { expiresIn: '1d' });
+    
+    // Set HttpOnly Cookie
+    res.cookie('token', token, {
+      httpOnly: true,
+      secure: false, // Set to true in production with HTTPS
+      sameSite: 'lax',
+      maxAge: 24 * 60 * 60 * 1000 // 1 day
+    });
+
+    res.json({ user: { id: user._id, name: user.name, email: user.email } });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -52,10 +95,34 @@ app.post('/api/auth/login', async (req, res) => {
     const validPassword = await bcrypt.compare(password, user.password);
     if (!validPassword) return res.status(400).json({ message: 'Invalid credentials' });
 
-    const token = jwt.sign({ id: user._id, name: user.name }, JWT_SECRET);
-    res.json({ user: { id: user._id, name: user.name, email: user.email }, token });
+    const token = jwt.sign({ id: user._id, name: user.name }, JWT_SECRET, { expiresIn: '1d' });
+
+    // Set HttpOnly Cookie
+    res.cookie('token', token, {
+      httpOnly: true,
+      secure: false, // Set to true in production with HTTPS
+      sameSite: 'lax',
+      maxAge: 24 * 60 * 60 * 1000 // 1 day
+    });
+
+    res.json({ user: { id: user._id, name: user.name, email: user.email } });
   } catch (error) {
     res.status(500).json({ message: error.message });
+  }
+});
+
+app.post('/api/auth/logout', (req, res) => {
+  res.clearCookie('token');
+  res.json({ message: 'Logged out successfully' });
+});
+
+app.get('/api/auth/me', authenticateToken, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id).select('-password');
+    if (!user) return res.sendStatus(404);
+    res.json({ user: { id: user._id, name: user.name, email: user.email } });
+  } catch (error) {
+    res.sendStatus(500);
   }
 });
 
@@ -107,14 +174,26 @@ app.post('/api/gigs', authenticateToken, async (req, res) => {
 });
 
 // --- Bid Routes ---
+
+// General bids query (e.g. for freelancer dashboard "My Bids")
 app.get('/api/bids', authenticateToken, async (req, res) => {
   try {
-    const { gigId, freelancerId } = req.query;
+    const { freelancerId } = req.query;
     let query = {};
-    if (gigId) query.gigId = gigId;
     if (freelancerId) query.freelancerId = freelancerId;
 
     const bids = await Bid.find(query);
+    res.json(bids);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Specific route for a gig's bids
+app.get('/api/bids/:gigId', authenticateToken, async (req, res) => {
+  try {
+    const { gigId } = req.params;
+    const bids = await Bid.find({ gigId });
     res.json(bids);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -140,25 +219,44 @@ app.post('/api/bids', authenticateToken, async (req, res) => {
 });
 
 // --- Hiring Logic ---
-app.post('/api/hire', authenticateToken, async (req, res) => {
+app.patch('/api/bids/:bidId/hire', authenticateToken, async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
   try {
-    const { gigId, bidId } = req.body;
+    const { bidId } = req.params;
     
+    // 1. Fetch Bid to identify the freelancer and gig
+    const bidToHire = await Bid.findById(bidId).session(session);
+    if (!bidToHire) throw new Error('Bid not found');
+    
+    const gigId = bidToHire.gigId;
+
+    // 2. Validate Gig
     const gig = await Gig.findById(gigId).session(session);
     if (!gig || gig.ownerId.toString() !== req.user.id) {
       throw new Error('Unauthorized or Gig not found');
     }
     if (gig.status !== 'open') throw new Error('Gig is not open');
 
+    // 3. Update Statuses
     gig.status = 'assigned';
     await gig.save({ session });
 
     await Bid.updateMany({ gigId }, { status: 'rejected' }, { session });
     await Bid.findByIdAndUpdate(bidId, { status: 'hired' }, { session });
 
+    // 4. Commit
     await session.commitTransaction();
+
+    // 5. Emit Real-time Notification to the Freelancer
+    // We send enough data for the frontend notification to display
+    io.to(bidToHire.freelancerId.toString()).emit('notification', {
+      id: bidToHire._id,
+      gigId: gig._id,
+      price: bidToHire.price,
+      status: 'hired'
+    });
+
     res.json({ success: true });
   } catch (error) {
     await session.abortTransaction();
@@ -172,6 +270,7 @@ app.post('/api/hire', authenticateToken, async (req, res) => {
 mongoose.connect(MONGO_URI)
   .then(() => {
     console.log('Connected to MongoDB');
-    app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+    // Changed app.listen to server.listen for Socket.io
+    server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
   })
   .catch(err => console.error(err));

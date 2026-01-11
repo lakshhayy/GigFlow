@@ -1,7 +1,7 @@
 import { User, Gig, Bid, AuthResponse } from '../types';
 
 // --- LocalStorage Helpers (Fallback Mechanism) ---
-const DELAY = 500; // Simulate network latency for fallback
+const DELAY = 200; // Reduced latency for better UX during fallback
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -24,72 +24,129 @@ const setLS = (key: string, data: any) => {
   localStorage.setItem(key, JSON.stringify(data));
 };
 
-// --- Hybrid Request Handler ---
-// Tries Fetch first, falls back to LS logic ONLY if Backend is unreachable or returns 5xx
-async function requestWithFallback<T>(
-  fetchFn: () => Promise<T>,
-  fallbackFn: () => Promise<T>
-): Promise<T> {
+// --- HTTP Helpers ---
+
+// Circuit Breaker State
+let isBackendOffline = false;
+
+// Wrapper to prevent hanging requests if backend is unresponsive
+const fetchWithTimeout = async (url: string, options: RequestInit = {}, timeout = 1000) => {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeout);
   try {
-    // Try the real backend
-    const response = await fetchFn();
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+    clearTimeout(id);
     return response;
-  } catch (error: any) {
-    // If the server responded with a 4xx error (e.g. 400 Bad Request, 401 Unauthorized),
-    // it means the server IS running and we should respect its logic decision.
-    // Do not fallback to mock data in this case.
-    
-    // EXCEPTION: If 404, it implies the route is missing. In a hybrid/demo app, 
-    // we often want to fallback to the mock implementation if the real API endpoint isn't there yet.
-    if (error.status && error.status >= 400 && error.status < 500 && error.status !== 404) {
-      throw error;
-    }
-
-    // Backend unavailable (Network Error), 404 Not Found, or 5xx Server Error.
-    console.warn('Backend unavailable, route missing (404), or returned 5xx. Switching to LocalStorage fallback.', error);
-    await sleep(DELAY);
-    try {
-      return await fallbackFn();
-    } catch (fallbackError) {
-      console.error('Fallback also failed:', fallbackError);
-      throw fallbackError;
-    }
+  } catch (error) {
+    clearTimeout(id);
+    throw error;
   }
-}
+};
 
-// Helper for Fetch requests with Auth Header
+// Helper for Fetch requests
+// We no longer manually send Authorization header; browser sends Cookie automatically via credentials: 'include'
 const getHeaders = () => {
-  const token = localStorage.getItem('gigflow_token');
   return {
     'Content-Type': 'application/json',
-    ...(token ? { Authorization: `Bearer ${token}` } : {}),
   };
 };
 
 const handleResponse = async (response: Response) => {
   const contentType = response.headers.get("content-type");
-  // If we get HTML (e.g. 404 page from Vite proxy fallback), treat as network error
   if (contentType && contentType.indexOf("application/json") === -1) {
     throw new Error("Server returned non-JSON response (likely 404/500)");
   }
 
   if (!response.ok) {
-    const errorData = await response.json().catch(() => ({ message: 'Request failed' }));
+    const errorData = await response.json().catch(() => ({ message: response.statusText || 'Request failed' }));
     const error: any = new Error(errorData.message || 'Request failed');
-    error.status = response.status; // Attach status code for fallback logic
+    error.status = response.status;
     throw error;
   }
   return response.json();
 };
 
+// --- Hybrid Request Handler ---
+async function requestWithFallback<T>(
+  fetchFn: () => Promise<T>,
+  fallbackFn: () => Promise<T>
+): Promise<T> {
+  // 1. Circuit Breaker: If we already detected backend is down, skip network entirely
+  if (isBackendOffline) {
+    return fallbackFn();
+  }
+
+  try {
+    // Try the real backend
+    const response = await fetchFn();
+    return response;
+  } catch (error: any) {
+    // 2. Error Analysis
+    
+    // If it's a 4xx client error (e.g., 400 Bad Request, 401 Unauthorized), 
+    // it means the server IS working but rejected the request. Do NOT fallback.
+    // Exception: 404 might mean the route is missing (e.g. backend not fully set up), so we fallback.
+    if (error.status && error.status >= 400 && error.status < 500 && error.status !== 404) {
+      throw error;
+    }
+
+    // 3. Detect Offline/Down State
+    // Conditions: Timeout (AbortError), Network Error (TypeError), 404 (Route missing), or 5xx (Server Error)
+    const isNetworkError = error.name === 'AbortError' || error.name === 'TypeError' || error.message.includes('non-JSON');
+    const isServerError = error.status && (error.status >= 500 || error.status === 404);
+
+    if (isNetworkError || isServerError) {
+      if (!isBackendOffline) {
+        console.warn('Backend unavailable (Timeout/5xx/404). Switching to Offline Mode.');
+        isBackendOffline = true;
+      }
+    }
+    
+    // 4. Execute Fallback
+    await sleep(DELAY);
+    try {
+      return await fallbackFn();
+    } catch (fallbackError: any) {
+      // Suppress logging for expected auth failures in fallback mode (e.g. not logged in)
+      if (fallbackError.message !== 'No session') {
+        console.error('Fallback also failed:', fallbackError);
+      }
+      throw fallbackError;
+    }
+  }
+}
+
 // --- Auth Services ---
+
+export const checkSession = async (): Promise<AuthResponse> => {
+  return requestWithFallback(
+    async () => {
+      const response = await fetchWithTimeout('/api/auth/me', {
+        method: 'GET',
+        headers: getHeaders(),
+        credentials: 'include', // Important: Sends the HttpOnly cookie
+      });
+      return handleResponse(response);
+    },
+    async () => {
+      // Fallback: check if we have a "mock session" in LS
+      const sessionUser = localStorage.getItem('gigflow_session_user');
+      if (!sessionUser) throw new Error('No session');
+      return { user: JSON.parse(sessionUser) };
+    }
+  );
+};
 
 export const register = async (name: string, email: string, password: string): Promise<AuthResponse> => {
   return requestWithFallback(
     async () => {
-      const response = await fetch('/api/auth/register', {
+      const response = await fetchWithTimeout('/api/auth/register', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getHeaders(),
+        credentials: 'include',
         body: JSON.stringify({ name, email, password }),
       });
       return handleResponse(response);
@@ -99,7 +156,10 @@ export const register = async (name: string, email: string, password: string): P
       if (users.find(u => u.email === email)) throw new Error('User already exists');
       const newUser: User = { id: generateId(), name, email, password }; 
       setLS('gigflow_users', [...users, newUser]);
-      return { user: newUser, token: 'mock-jwt-token-' + newUser.id };
+      
+      // Set mock session
+      localStorage.setItem('gigflow_session_user', JSON.stringify(newUser));
+      return { user: newUser };
     }
   );
 };
@@ -107,21 +167,58 @@ export const register = async (name: string, email: string, password: string): P
 export const login = async (email: string, password: string): Promise<AuthResponse> => {
   return requestWithFallback(
     async () => {
-      const response = await fetch('/api/auth/login', {
+      const response = await fetchWithTimeout('/api/auth/login', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getHeaders(),
+        credentials: 'include',
         body: JSON.stringify({ email, password }),
       });
       return handleResponse(response);
     },
     async () => {
       const users = getLS<User>('gigflow_users');
+      
+      // --- DEMO ACCOUNT LOGIC ---
+      // This ensures you can login immediately without creating an account
+      if (email === 'demo@gigflow.com' && password === 'password') {
+         const demoUser: User = { 
+           id: 'demo-owner', 
+           name: 'Alice Client', 
+           email: 'demo@gigflow.com' 
+         };
+         // Auto-save to users list if not there, to keep things consistent
+         if (!users.find(u => u.email === email)) {
+             setLS('gigflow_users', [...users, { ...demoUser, password: 'password' }]);
+         }
+         localStorage.setItem('gigflow_session_user', JSON.stringify(demoUser));
+         return { user: demoUser };
+      }
+      // ---------------------------
+
       const user = users.find(u => u.email === email && u.password === password);
       if (!user) throw new Error('Invalid credentials');
-      return { user, token: 'mock-jwt-token-' + user.id };
+      
+      // Set mock session
+      localStorage.setItem('gigflow_session_user', JSON.stringify(user));
+      return { user };
     }
   );
 };
+
+export const logout = async (): Promise<void> => {
+  return requestWithFallback(
+    async () => {
+      await fetchWithTimeout('/api/auth/logout', {
+         method: 'POST',
+         headers: getHeaders(),
+         credentials: 'include'
+      });
+    },
+    async () => {
+      localStorage.removeItem('gigflow_session_user');
+    }
+  )
+}
 
 // --- Gig Services ---
 
@@ -130,12 +227,14 @@ export const getGigs = async (search?: string): Promise<Gig[]> => {
     async () => {
       const params = new URLSearchParams();
       if (search) params.append('search', search);
-      const response = await fetch(`/api/gigs?${params.toString()}`);
+      const response = await fetchWithTimeout(`/api/gigs?${params.toString()}`, {
+         headers: getHeaders(),
+         credentials: 'include'
+      });
       return handleResponse(response);
     },
     async () => {
       let gigs = getLS<Gig>('gigflow_gigs');
-      // Seed if empty for demo
       if (gigs.length === 0) {
         gigs = [
           {
@@ -163,7 +262,10 @@ export const getGigs = async (search?: string): Promise<Gig[]> => {
 export const getMyGigs = async (userId: string): Promise<Gig[]> => {
   return requestWithFallback(
     async () => {
-      const response = await fetch(`/api/gigs?ownerId=${userId}`);
+      const response = await fetchWithTimeout(`/api/gigs?ownerId=${userId}`, {
+         headers: getHeaders(),
+         credentials: 'include'
+      });
       return handleResponse(response);
     },
     async () => {
@@ -176,7 +278,10 @@ export const getMyGigs = async (userId: string): Promise<Gig[]> => {
 export const getGigById = async (id: string): Promise<Gig | undefined> => {
   return requestWithFallback(
     async () => {
-      const response = await fetch(`/api/gigs/${id}`);
+      const response = await fetchWithTimeout(`/api/gigs/${id}`, {
+         headers: getHeaders(),
+         credentials: 'include'
+      });
       if (response.status === 404) return undefined;
       return handleResponse(response);
     },
@@ -190,9 +295,10 @@ export const getGigById = async (id: string): Promise<Gig | undefined> => {
 export const createGig = async (gigData: Omit<Gig, 'id' | 'createdAt' | 'status'>): Promise<Gig> => {
   return requestWithFallback(
     async () => {
-      const response = await fetch('/api/gigs', {
+      const response = await fetchWithTimeout('/api/gigs', {
         method: 'POST',
         headers: getHeaders(),
+        credentials: 'include',
         body: JSON.stringify(gigData),
       });
       return handleResponse(response);
@@ -216,8 +322,10 @@ export const createGig = async (gigData: Omit<Gig, 'id' | 'createdAt' | 'status'
 export const getBidsForGig = async (gigId: string): Promise<Bid[]> => {
   return requestWithFallback(
     async () => {
-      const response = await fetch(`/api/bids?gigId=${gigId}`, {
+      // Changed to use the new route /api/bids/:gigId
+      const response = await fetchWithTimeout(`/api/bids/${gigId}`, {
         headers: getHeaders(),
+        credentials: 'include',
       });
       return handleResponse(response);
     },
@@ -231,8 +339,9 @@ export const getBidsForGig = async (gigId: string): Promise<Bid[]> => {
 export const getMyBids = async (userId: string): Promise<{ bid: Bid, gig: Gig }[]> => {
   return requestWithFallback(
     async () => {
-      const bidsResponse = await fetch(`/api/bids?freelancerId=${userId}`, {
+      const bidsResponse = await fetchWithTimeout(`/api/bids?freelancerId=${userId}`, {
         headers: getHeaders(),
+        credentials: 'include',
       });
       const bids: Bid[] = await handleResponse(bidsResponse);
       const results = await Promise.all(bids.map(async (bid) => {
@@ -259,9 +368,10 @@ export const getMyBids = async (userId: string): Promise<{ bid: Bid, gig: Gig }[
 export const createBid = async (bidData: Omit<Bid, 'id' | 'createdAt' | 'status'>): Promise<Bid> => {
   return requestWithFallback(
     async () => {
-      const response = await fetch('/api/bids', {
+      const response = await fetchWithTimeout('/api/bids', {
         method: 'POST',
         headers: getHeaders(),
+        credentials: 'include',
         body: JSON.stringify(bidData),
       });
       return handleResponse(response);
@@ -288,10 +398,12 @@ export const createBid = async (bidData: Omit<Bid, 'id' | 'createdAt' | 'status'
 export const hireFreelancer = async (gigId: string, bidId: string): Promise<void> => {
   return requestWithFallback(
     async () => {
-      const response = await fetch('/api/hire', {
-        method: 'POST',
+      // Changed to use the new route PATCH /api/bids/:bidId/hire
+      const response = await fetchWithTimeout(`/api/bids/${bidId}/hire`, {
+        method: 'PATCH',
         headers: getHeaders(),
-        body: JSON.stringify({ gigId, bidId }),
+        credentials: 'include',
+        // No body required for this specific action
       });
       return handleResponse(response);
     },
@@ -303,7 +415,8 @@ export const hireFreelancer = async (gigId: string, bidId: string): Promise<void
       if (gigIndex === -1) throw new Error('Gig not found');
 
       // Update Gig Status
-      gigs[gigIndex].status = 'assigned';
+      // We must spread the object properly
+      gigs[gigIndex] = { ...gigs[gigIndex], status: 'assigned' };
       setLS('gigflow_gigs', gigs);
 
       // Update Bids Status

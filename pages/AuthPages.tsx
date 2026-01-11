@@ -17,8 +17,8 @@ export const Login: React.FC = () => {
     setLoading(true);
     setError('');
     try {
-      const { user, token } = await login(email, password);
-      loginUser(user, token);
+      const { user } = await login(email, password);
+      loginUser(user);
       navigate('/');
     } catch (err: any) {
       setError(err.message);
@@ -100,8 +100,8 @@ export const Register: React.FC = () => {
     setLoading(true);
     setError('');
     try {
-      const { user, token } = await register(name, email, password);
-      loginUser(user, token);
+      const { user } = await register(name, email, password);
+      loginUser(user);
       navigate('/');
     } catch (err: any) {
       setError(err.message);

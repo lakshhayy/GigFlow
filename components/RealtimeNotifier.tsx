@@ -1,47 +1,39 @@
 import React, { useEffect, useState } from 'react';
 import { useAuth } from '../context/AuthContext';
-import { getMyBids } from '../services/mockApi'; // Using the API service
 import { Bid } from '../types';
 import { X, CheckCircle } from 'lucide-react';
 import { Link } from 'react-router-dom';
+import { io } from 'socket.io-client';
 
 export const RealtimeNotifier: React.FC = () => {
   const { user, isAuthenticated } = useAuth();
   const [notifications, setNotifications] = useState<Bid[]>([]);
-  const [notifiedIds, setNotifiedIds] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     if (!isAuthenticated || !user) return;
 
-    const checkHires = async () => {
-      try {
-        // Fetch fresh bids from server
-        const myBidsWithGigs = await getMyBids(user.id);
-        
-        // Filter for hired bids
-        const hiredBids = myBidsWithGigs
-          .map(item => item.bid)
-          .filter(b => b.status === 'hired');
+    // Connect to the backend
+    // Assumes backend is running on port 5000. 
+    // In production, this would likely match window.location.origin
+    const socket = io('http://localhost:5000');
 
-        const newNotifications = hiredBids.filter(b => !notifiedIds.has(b.id));
+    // Join room identified by User ID
+    socket.emit('join', user.id);
 
-        if (newNotifications.length > 0) {
-          setNotifications(prev => [...prev, ...newNotifications]);
-          setNotifiedIds(prev => {
-            const next = new Set(prev);
-            newNotifications.forEach(n => next.add(n.id));
-            return next;
-          });
-        }
-      } catch (e) {
-        console.error("Polling error", e);
-      }
+    // Listen for hiring notifications
+    socket.on('notification', (newNotification: Bid) => {
+      // Add to list if we haven't seen this ID yet (basic dedup)
+      setNotifications(prev => {
+        if (prev.some(n => n.id === newNotification.id)) return prev;
+        return [...prev, newNotification];
+      });
+    });
+
+    // Cleanup on unmount or user change
+    return () => {
+      socket.disconnect();
     };
-
-    const interval = setInterval(checkHires, 10000); // Poll every 10 seconds
-
-    return () => clearInterval(interval);
-  }, [user, isAuthenticated, notifiedIds]);
+  }, [user, isAuthenticated]);
 
   const removeNotification = (id: string) => {
     setNotifications(prev => prev.filter(n => n.id !== id));
@@ -66,7 +58,11 @@ export const RealtimeNotifier: React.FC = () => {
               <p className="text-sm text-gray-600 mt-1">
                 Your bid of ${notification.price} was accepted.
               </p>
-              <Link to={`/gigs/${notification.gigId}`} className="text-xs text-primary font-medium hover:underline mt-2 block">
+              <Link 
+                to={`/gigs/${notification.gigId}`} 
+                onClick={() => removeNotification(notification.id)}
+                className="text-xs text-primary font-medium hover:underline mt-2 block"
+              >
                 View Gig Details
               </Link>
             </div>

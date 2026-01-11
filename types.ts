@@ -33,5 +33,4 @@ export interface Bid {
 
 export interface AuthResponse {
   user: User;
-  token: string;
 }
