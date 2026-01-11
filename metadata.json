@@ -1,0 +1,5 @@
+{
+  "name": "GigFlow",
+  "description": "A mini-freelance marketplace where Clients can post jobs and Freelancers can bid on them. Features fluid roles, secure-simulated authentication, and comprehensive hiring logic.",
+  "requestFramePermissions": []
+}
