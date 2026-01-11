@@ -13,13 +13,9 @@ export const RealtimeNotifier: React.FC = () => {
     if (!isAuthenticated || !user) return;
 
     // Connect to the backend
-    // If no URL is provided, it defaults to window.location.host
-    // This works perfectly for both:
-    // 1. Development (via Vite proxy if configured, otherwise needs explicit URL)
-    // 2. Production (when frontend is served by backend)
-    // For local dev with separate ports (Vite 5173, Server 5000), we need the explicit URL if not proxied for WS.
-    // However, in production, they are same origin.
-    const socket = io(process.env.NODE_ENV === 'production' ? undefined : 'http://localhost:5000');
+    // Uses VITE_BACKEND_URL from environment variables for production (e.g. Render URL)
+    // Fallbacks to localhost for development
+    const socket = io((import.meta as any).env.VITE_BACKEND_URL || 'http://localhost:5000');
 
     // Join room identified by User ID
     socket.emit('join', user.id);
